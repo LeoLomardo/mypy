@@ -9,8 +9,10 @@ import tempfile
 from pathlib import Path
 
 from mypy import build
+from mypy.build import BuildResult
 from mypy.errors import CompileError
 from mypy.modulefinder import BuildSource, FindModuleCache, SearchPaths
+from mypy.options import Options
 from mypy.test.config import test_data_prefix, test_temp_dir
 from mypy.test.data import DataDrivenTestCase, DataSuite, FileOperation, module_from_path
 from mypy.test.helpers import (
@@ -107,127 +109,26 @@ class TypeCheckSuite(DataSuite):
         operations: list[FileOperation] | None = None,
         incremental_step: int = 0,
     ) -> None:
+        """Orchestrates running a single type check test case."""
         if operations is None:
             operations = []
+
         original_program_text = "\n".join(testcase.input)
         module_data = self.parse_module(original_program_text, incremental_step)
 
-        # Unload already loaded plugins, they may be updated.
-        for file, _ in testcase.files:
-            module = module_from_path(file)
-            if module.endswith("_plugin") and module in sys.modules:
-                del sys.modules[module]
-        if incremental_step == 0 or incremental_step == 1:
-            # In run 1, copy program text to program file.
-            for module_name, program_path, program_text in module_data:
-                if module_name == "__main__":
-                    with open(program_path, "w", encoding="utf8") as f:
-                        f.write(program_text)
-                    break
-        elif incremental_step > 1:
-            # In runs 2+, copy *.[num] files to * files.
-            perform_file_operations(operations)
+        self._prepare_test_files(testcase, module_data, operations, incremental_step)
 
-        # Parse options after moving files (in case mypy.ini is being moved).
-        options = parse_options(original_program_text, testcase, incremental_step)
-        options.use_builtins_fixtures = True
-        options.show_traceback = True
+        options = self._configure_options(testcase, original_program_text, incremental_step)
 
-        # Enable some options automatically based on test file name.
-        if "columns" in testcase.file:
-            options.show_column_numbers = True
-        if "errorcodes" in testcase.file:
-            options.hide_error_codes = False
-        if "abstract" not in testcase.file:
-            options.allow_empty_bodies = not testcase.name.endswith("_no_empty")
-        if "union-error" not in testcase.file:
-            options.force_union_syntax = True
+        sources = [
+            BuildSource(path, name, None if incremental_step else text)
+            for name, path, text in module_data
+        ]
 
-        if incremental_step and options.incremental:
-            # Don't overwrite # flags: --no-incremental in incremental test cases
-            options.incremental = True
-        else:
-            options.incremental = False
-            # Don't waste time writing cache unless we are specifically looking for it
-            if not testcase.writescache:
-                options.cache_dir = os.devnull
-
-        sources = []
-        for module_name, program_path, program_text in module_data:
-            # Always set to none so we're forced to reread the module in incremental mode
-            sources.append(
-                BuildSource(program_path, module_name, None if incremental_step else program_text)
-            )
-
-        plugin_dir = os.path.join(test_data_prefix, "plugins")
-        sys.path.insert(0, plugin_dir)
-
-        res = None
-        blocker = False
-        try:
-            res = build.build(sources=sources, options=options, alt_lib_path=test_temp_dir)
-            a = res.errors
-        except CompileError as e:
-            a = e.messages
-            blocker = True
-        finally:
-            assert sys.path[0] == plugin_dir
-            del sys.path[0]
-
-        if testcase.normalize_output:
-            a = normalize_error_messages(a)
-
-        # Make sure error messages match
-        if incremental_step < 2:
-            if incremental_step == 1:
-                msg = "Unexpected type checker output in incremental, run 1 ({}, line {})"
-            else:
-                assert incremental_step == 0
-                msg = "Unexpected type checker output ({}, line {})"
-            self._sort_output_if_needed(testcase, a)
-            output = testcase.output
-        else:
-            msg = (
-                f"Unexpected type checker output in incremental, run {incremental_step}"
-                + " ({}, line {})"
-            )
-            output = testcase.output2.get(incremental_step, [])
-
-        if output != a and testcase.config.getoption("--update-data", False):
-            update_testcase_output(testcase, a, incremental_step=incremental_step)
-
-        assert_string_arrays_equal(output, a, msg.format(testcase.file, testcase.line))
-
-        if res:
-            if options.cache_dir != os.devnull:
-                self.verify_cache(module_data, res.manager, blocker, incremental_step)
-
-            name = "targets"
-            if incremental_step:
-                name += str(incremental_step + 1)
-            expected = testcase.expected_fine_grained_targets.get(incremental_step + 1)
-            actual = [
-                target
-                for module, target in res.manager.processed_targets
-                if module in testcase.test_modules
-            ]
-            if expected is not None:
-                assert_target_equivalence(name, expected, actual)
-            if incremental_step > 1:
-                suffix = "" if incremental_step == 2 else str(incremental_step - 1)
-                expected_rechecked = testcase.expected_rechecked_modules.get(incremental_step - 1)
-                if expected_rechecked is not None:
-                    assert_module_equivalence(
-                        "rechecked" + suffix, expected_rechecked, res.manager.rechecked_modules
-                    )
-                expected_stale = testcase.expected_stale_modules.get(incremental_step - 1)
-                if expected_stale is not None:
-                    assert_module_equivalence(
-                        "stale" + suffix, expected_stale, res.manager.stale_modules
-                    )
-
-        if testcase.output_files:
-            check_test_output_files(testcase, incremental_step, strip_prefix="tmp/")
+        res, errors, blocker = self._execute_build(sources, options)
+        self._verify_build_output(
+            testcase, res, errors, blocker, module_data, incremental_step, options
+        )
 
     def verify_cache(
         self,
@@ -309,3 +210,137 @@ class TypeCheckSuite(DataSuite):
             return out
         else:
             return [("__main__", "main", program_text)]
+
+    def _prepare_test_files(
+        self,
+        testcase: DataDrivenTestCase,
+        module_data: list[tuple[str, str, str]],
+        operations: list[FileOperation],
+        incremental_step: int,
+    ) -> None:
+        """Prepares the source files for test execution."""
+        # Unloads already loaded plugins, as they may be updated
+        for file, _ in testcase.files:
+            module = module_from_path(file)
+            if module.endswith("_plugin") and module in sys.modules:
+                del sys.modules[module]
+
+        if incremental_step <= 1:
+            # On the first run, write the source code to the main file
+            for module_name, program_path, program_text in module_data:
+                if module_name == "__main__":
+                    with open(program_path, "w", encoding="utf8") as f:
+                        f.write(program_text)
+                    break
+        else:
+            perform_file_operations(operations)
+
+    def _configure_options(
+        self, testcase: DataDrivenTestCase, original_program_text: str, incremental_step: int
+    ) -> Options:
+        """Configures the mypy options for test execution."""
+
+        options = parse_options(original_program_text, testcase, incremental_step)
+        options.use_builtins_fixtures = True
+        options.show_traceback = True
+
+        if "columns" in testcase.file:
+            options.show_column_numbers = True
+        if "errorcodes" in testcase.file:
+            options.hide_error_codes = False
+        if "abstract" not in testcase.file:
+            options.allow_empty_bodies = not testcase.name.endswith("_no_empty")
+        if "union-error" not in testcase.file:
+            options.force_union_syntax = True
+
+        if incremental_step and options.incremental:
+            options.incremental = True
+        else:
+            options.incremental = False
+            if not testcase.writescache:
+                options.cache_dir = os.devnull
+
+        return options
+
+    def _execute_build(
+        self, sources: list[BuildSource], options: Options
+    ) -> tuple[BuildResult | None, list[str], bool]:
+        """Executes the mypy build and returns the results."""
+        plugin_dir = os.path.join(test_data_prefix, "plugins")
+        sys.path.insert(0, plugin_dir)
+
+        res: BuildResult | None = None
+        errors: list[str] = []
+        blocker = False
+        try:
+            res = build.build(sources=sources, options=options, alt_lib_path=test_temp_dir)
+            errors = res.errors
+        except CompileError as e:
+            errors = e.messages
+            blocker = True
+        finally:
+            assert sys.path[0] == plugin_dir
+            del sys.path[0]
+
+        return res, errors, blocker
+
+    def _verify_build_output(
+        self,
+        testcase: DataDrivenTestCase,
+        res: BuildResult | None,
+        errors: list[str],
+        blocker: bool,
+        module_data: list[tuple[str, str, str]],
+        incremental_step: int,
+        options: Options,
+    ) -> None:
+        """Verifies that the build output matches the expected output."""
+
+        if testcase.normalize_output:
+            errors = normalize_error_messages(errors)
+
+        if incremental_step < 2:
+            expected_output = testcase.output
+            msg_template = "Unexpected type checker output ({}, line {})"
+            if incremental_step == 1:
+                msg_template = "Unexpected type checker output in incremental, run 1 ({}, line {})"
+        else:
+            expected_output = testcase.output2.get(incremental_step, [])
+            msg_template = (
+                f"Unexpected type checker output in incremental, run {incremental_step}"
+                + " ({}, line {})"
+            )
+        self._sort_output_if_needed(testcase, errors)
+        if expected_output != errors and testcase.config.getoption("--update-data", False):
+            update_testcase_output(testcase, errors, incremental_step=incremental_step)
+        assert_string_arrays_equal(
+            expected_output, errors, msg_template.format(testcase.file, testcase.line)
+        )
+        if res:
+            if options.cache_dir != os.devnull:
+                self.verify_cache(module_data, res.manager, blocker, incremental_step)
+            name = "targets"
+            if incremental_step:
+                name += str(incremental_step + 1)
+            expected = testcase.expected_fine_grained_targets.get(incremental_step + 1)
+            actual = [
+                target
+                for module, target in res.manager.processed_targets
+                if module in testcase.test_modules
+            ]
+            if expected is not None:
+                assert_target_equivalence(name, expected, actual)
+            if incremental_step > 1:
+                suffix = "" if incremental_step == 2 else str(incremental_step - 1)
+                expected_rechecked = testcase.expected_rechecked_modules.get(incremental_step - 1)
+                if expected_rechecked is not None:
+                    assert_module_equivalence(
+                        "rechecked" + suffix, expected_rechecked, res.manager.rechecked_modules
+                    )
+                expected_stale = testcase.expected_stale_modules.get(incremental_step - 1)
+                if expected_stale is not None:
+                    assert_module_equivalence(
+                        "stale" + suffix, expected_stale, res.manager.stale_modules
+                    )
+        if testcase.output_files:
+            check_test_output_files(testcase, incremental_step, strip_prefix="tmp/")
